@@ -37,11 +37,16 @@ const PishlemeDaemon = struct {
     allocator: Allocator,
     app_rules: ArrayList(AppRule),
     running: bool = true,
+    last_reset_day: i64,
 
     fn init(allocator: Allocator) PishlemeDaemon {
+        const now = time.timestamp();
+        const current_day = @divFloor(now, 86400); // 86400 seconds in a day
+
         return PishlemeDaemon{
             .allocator = allocator,
             .app_rules = ArrayList(AppRule).init(allocator),
+            .last_reset_day = current_day,
         };
     }
 
@@ -59,7 +64,7 @@ const PishlemeDaemon = struct {
 
     fn findProcessesByName(self: *PishlemeDaemon, app_name: []const u8) !ArrayList(c.pid_t) {
         var pids = ArrayList(c.pid_t).init(self.allocator);
-        
+
         // First try exact match
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
@@ -74,10 +79,10 @@ const PishlemeDaemon = struct {
             };
             return self.parseProcessOutput(result2, &pids);
         };
-        
+
         return self.parseProcessOutput(result, &pids);
     }
-    
+
     fn parseProcessOutput(self: *PishlemeDaemon, result: std.process.Child.RunResult, pids: *ArrayList(c.pid_t)) !ArrayList(c.pid_t) {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
@@ -111,7 +116,7 @@ const PishlemeDaemon = struct {
         for (current_pids.items) |pid| {
             try rule.process_ids.append(pid);
         }
-        
+
         // Debug output to help troubleshoot
         if (current_pids.items.len > 0) {
             print("DEBUG: Found {d} processes for {s}: ", .{ current_pids.items.len, rule.name });
@@ -142,15 +147,15 @@ const PishlemeDaemon = struct {
                 rule.grace_period_start = now;
                 print("Time already exceeded for {s} ({d}s). Grace period: 5 seconds before termination.\n", .{ rule.name, rule.elapsed_time });
             }
-            
+
             const grace_elapsed = @as(u64, @intCast(now - rule.grace_period_start.?));
             if (grace_elapsed >= 5) {
                 print("Grace period expired for {s}. Terminating processes...\n", .{rule.name});
-                
+
                 for (rule.process_ids.items) |pid| {
                     killProcess(pid);
                 }
-                
+
                 rule.process_ids.clearRetainingCapacity();
                 rule.grace_period_start = null;
             } else {
@@ -171,13 +176,13 @@ const PishlemeDaemon = struct {
         if (total_time >= rule.time_limit_seconds) {
             rule.elapsed_time = total_time;
             rule.start_time = null;
-            
+
             print("Time limit reached for {s} ({d}s). Terminating processes...\n", .{ rule.name, total_time });
-            
+
             for (rule.process_ids.items) |pid| {
                 killProcess(pid);
             }
-            
+
             rule.process_ids.clearRetainingCapacity();
         } else {
             const remaining = rule.time_limit_seconds - total_time;
@@ -185,14 +190,36 @@ const PishlemeDaemon = struct {
         }
     }
 
+    fn checkDailyReset(self: *PishlemeDaemon) void {
+        const now = time.timestamp();
+        const current_day = @divFloor(now, 86400); // 86400 seconds in a day
+
+        if (current_day > self.last_reset_day) {
+            print("Daily reset: Resetting all application timers\n", .{});
+
+            for (self.app_rules.items) |*rule| {
+                rule.elapsed_time = 0;
+                rule.start_time = null;
+                rule.grace_period_start = null;
+                rule.process_ids.clearRetainingCapacity();
+                print("Reset timer for {s}\n", .{rule.name});
+            }
+
+            self.last_reset_day = current_day;
+        }
+    }
+
     fn run(self: *PishlemeDaemon) !void {
         print("Pishleme daemon started. Monitoring {} applications...\n", .{self.app_rules.items.len});
-        
+        print("Daily reset enabled: timers reset at midnight each day\n", .{});
+
         while (self.running) {
+            self.checkDailyReset();
+
             for (self.app_rules.items) |*rule| {
                 try self.checkAndEnforceTimeLimit(rule);
             }
-            
+
             std.time.sleep(1 * std.time.ns_per_s);
         }
     }
@@ -235,17 +262,17 @@ pub fn main() !void {
                 printUsage(args[0]);
                 return;
             }
-            
+
             const app_name = args[i + 1];
             const time_str = args[i + 3];
             const time_limit = std.fmt.parseInt(u64, time_str, 10) catch {
                 print("Error: Invalid time limit '{s}'\n", .{time_str});
                 return;
             };
-            
+
             try daemon.addAppRule(app_name, time_limit);
             print("Added rule: {s} - {d} seconds\n", .{ app_name, time_limit });
-            
+
             i += 4;
         } else {
             print("Error: Unknown argument '{s}'\n", .{args[i]});
