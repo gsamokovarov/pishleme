@@ -10,19 +10,14 @@ const cc = @cImport({
     @cInclude("sys/sysctl.h");
     @cInclude("sys/proc.h");
     @cInclude("time.h");
+    @cInclude("signal.h");
 });
-
-const SIGKILL = 9;
-const SIGTERM = 15;
-const SIGINT = 2;
 
 const SECONDS_PER_DAY: i64 = 86400;
 const GRACE_PERIOD_SECONDS: u64 = 5;
 const POLLING_INTERVAL_NS: u64 = 1 * std.time.ns_per_s;
 
 var g_daemon_running: bool = true;
-
-extern fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.C) void) ?*const fn (c_int) callconv(.C) void;
 
 fn signalHandler(sig: c_int) callconv(.C) void {
     _ = sig;
@@ -287,7 +282,7 @@ fn killProcesses(rule: *AppRule, reason: []const u8) void {
 
     print("{s}: {s}. Terminating {d} processes...\n", .{ rule.name, reason, rule.process_ids.items.len });
     for (rule.process_ids.items) |pid| {
-        const result = c.kill(pid, SIGKILL);
+        const result = c.kill(pid, cc.SIGKILL);
         if (result == 0) {
             print("Killed process {d} with SIGKILL\n", .{pid});
         } else {
@@ -323,8 +318,8 @@ pub fn main() !void {
     }
 
     // Set up signal handlers for graceful shutdown
-    _ = signal(SIGTERM, signalHandler);
-    _ = signal(SIGINT, signalHandler);
+    _ = cc.signal(cc.SIGTERM, signalHandler);
+    _ = cc.signal(cc.SIGINT, signalHandler);
 
     var daemon = PishlemeDaemon.init(allocator);
     defer daemon.deinit();
