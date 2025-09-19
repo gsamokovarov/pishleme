@@ -96,20 +96,13 @@ const PishlemeDaemon = struct {
 
     fn findProcessesByName(self: *PishlemeDaemon, app_name: []const u8) !ArrayList(c.pid_t) {
         var pids = ArrayList(c.pid_t).init(self.allocator);
+        errdefer pids.deinit();
 
-        // First try exact match
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
-            .argv = &[_][]const u8{ "pgrep", "-i", "-x", app_name },
+            .argv = &[_][]const u8{ "pgrep", "-i", app_name },
         }) catch {
-            // If pgrep fails, try with case-insensitive partial match for .app bundles
-            const result2 = std.process.Child.run(.{
-                .allocator = self.allocator,
-                .argv = &[_][]const u8{ "pgrep", "-i", app_name },
-            }) catch {
-                return pids; // Return empty list if both fail
-            };
-            return self.parseProcessOutput(result2, &pids);
+            return pids;
         };
 
         return self.parseProcessOutput(result, &pids);
@@ -123,7 +116,13 @@ const PishlemeDaemon = struct {
             var lines = std.mem.splitSequence(u8, result.stdout, "\n");
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
-                const pid = std.fmt.parseInt(c.pid_t, std.mem.trim(u8, line, " \t\n"), 10) catch continue;
+                const trimmed = std.mem.trim(u8, line, " \t\n");
+                if (trimmed.len == 0) continue;
+
+                const pid = std.fmt.parseInt(c.pid_t, trimmed, 10) catch {
+                    print("Warning: Failed to parse PID '{s}'\n", .{trimmed});
+                    continue;
+                };
                 try pids.append(pid);
             }
         }
@@ -131,14 +130,6 @@ const PishlemeDaemon = struct {
         return pids.*;
     }
 
-    fn killProcess(pid: c.pid_t) void {
-        const result = c.kill(pid, SIGKILL);
-        if (result == 0) {
-            print("Killed process {d} with SIGKILL\n", .{pid});
-        } else {
-            print("Failed to kill process {d}\n", .{pid});
-        }
-    }
 
     fn updateProcessList(self: *PishlemeDaemon, rule: *AppRule) !void {
         rule.process_ids.clearRetainingCapacity();
@@ -166,7 +157,8 @@ const PishlemeDaemon = struct {
 
         if (rule.process_ids.items.len == 0) {
             if (rule.start_time != null) {
-                rule.elapsed_time += @intCast(now - rule.start_time.?);
+                const session_time = std.math.cast(u64, now - rule.start_time.?) orelse 0;
+                rule.elapsed_time = std.math.add(u64, rule.elapsed_time, session_time) catch rule.elapsed_time;
                 rule.start_time = null;
                 print("{s}: Not running. Total usage: {d}s\n", .{ rule.name, rule.elapsed_time });
             }
@@ -175,14 +167,10 @@ const PishlemeDaemon = struct {
         }
 
         if (!self.isGloballyAllowed()) {
-            print("{s}: Outside allowed hours. Terminating processes...\n", .{rule.name});
-            for (rule.process_ids.items) |pid| {
-                killProcess(pid);
-            }
-            rule.process_ids.clearRetainingCapacity();
-            rule.grace_period_start = null;
+            killProcesses(rule, "Outside allowed hours");
             if (rule.start_time != null) {
-                rule.elapsed_time += @intCast(now - rule.start_time.?);
+                const session_time = std.math.cast(u64, now - rule.start_time.?) orelse 0;
+                rule.elapsed_time = std.math.add(u64, rule.elapsed_time, session_time) catch rule.elapsed_time;
                 rule.start_time = null;
             }
             return;
@@ -194,16 +182,9 @@ const PishlemeDaemon = struct {
                 print("Time already exceeded for {s} ({d}s). Grace period: 5 seconds before termination.\n", .{ rule.name, rule.elapsed_time });
             }
 
-            const grace_elapsed = @as(u64, @intCast(now - rule.grace_period_start.?));
+            const grace_elapsed = std.math.cast(u64, now - rule.grace_period_start.?) orelse 0;
             if (grace_elapsed >= 5) {
-                print("Grace period expired for {s}. Terminating processes...\n", .{rule.name});
-
-                for (rule.process_ids.items) |pid| {
-                    killProcess(pid);
-                }
-
-                rule.process_ids.clearRetainingCapacity();
-                rule.grace_period_start = null;
+                killProcesses(rule, "Grace period expired");
             } else {
                 const grace_remaining = 5 - grace_elapsed;
                 print("{s}: Time limit exceeded. Terminating in {d} seconds...\n", .{ rule.name, grace_remaining });
@@ -216,20 +197,23 @@ const PishlemeDaemon = struct {
             print("{s}: Started running. Current total usage: {d}s\n", .{ rule.name, rule.elapsed_time });
         }
 
-        const current_session_time = @as(u64, @intCast(now - rule.start_time.?));
-        const total_time = rule.elapsed_time + current_session_time;
+        const session_time = std.math.cast(u64, now - rule.start_time.?) orelse {
+            print("Warning: Session time overflow for {s}, resetting\n", .{rule.name});
+            rule.start_time = now;
+            return;
+        };
+        const total_time = std.math.add(u64, rule.elapsed_time, session_time) catch blk: {
+            print("Warning: Total time overflow for {s}, capping at limit\n", .{rule.name});
+            break :blk rule.time_limit_seconds;
+        };
 
         if (total_time >= rule.time_limit_seconds) {
             rule.elapsed_time = total_time;
             rule.start_time = null;
 
-            print("Time limit reached for {s} ({d}s). Terminating processes...\n", .{ rule.name, total_time });
-
-            for (rule.process_ids.items) |pid| {
-                killProcess(pid);
-            }
-
-            rule.process_ids.clearRetainingCapacity();
+            const reason = std.fmt.allocPrint(self.allocator, "Time limit reached ({d}s)", .{total_time}) catch "Time limit reached";
+            defer if (!std.mem.eql(u8, reason, "Time limit reached")) self.allocator.free(reason);
+            killProcesses(rule, reason);
         } else {
             const remaining = rule.time_limit_seconds - total_time;
             print("{s}: Running - {d}/{d}s used, {d}s remaining\n", .{ rule.name, total_time, rule.time_limit_seconds, remaining });
@@ -270,6 +254,22 @@ const PishlemeDaemon = struct {
         }
     }
 };
+
+fn killProcesses(rule: *AppRule, reason: []const u8) void {
+    if (rule.process_ids.items.len == 0) return;
+
+    print("{s}: {s}. Terminating {d} processes...\n", .{ rule.name, reason, rule.process_ids.items.len });
+    for (rule.process_ids.items) |pid| {
+        const result = c.kill(pid, SIGKILL);
+        if (result == 0) {
+            print("Killed process {d} with SIGKILL\n", .{pid});
+        } else {
+            print("Failed to kill process {d}\n", .{pid});
+        }
+    }
+    rule.process_ids.clearRetainingCapacity();
+    rule.grace_period_start = null;
+}
 
 fn printUsage(program_name: []const u8) void {
     print("Usage: {s} [options]\n", .{program_name});
