@@ -11,11 +11,12 @@ const cc = @cImport({
     @cInclude("sys/proc.h");
     @cInclude("time.h");
     @cInclude("signal.h");
+    @cInclude("sys/event.h");
 });
 
 const SECONDS_PER_DAY: i64 = 86400;
 const GRACE_PERIOD_SECONDS: u64 = 5;
-const POLLING_INTERVAL_NS: u64 = 1 * std.time.ns_per_s;
+const POLLING_INTERVAL_MILLISECONDS: u64 = 1000;
 
 var g_daemon_running: bool = true;
 
@@ -264,16 +265,92 @@ const PishlemeDaemon = struct {
     fn run(self: *PishlemeDaemon) !void {
         print("Pishleme daemon started. Monitoring {} applications...\n", .{self.app_rules.items.len});
         print("Daily reset enabled: timers reset at midnight each day\n", .{});
+        print("Using event-driven kqueue loop for efficient monitoring\n", .{});
+
+        // Create kqueue for event monitoring
+        const kq = cc.kqueue();
+        if (kq == -1) {
+            print("Error: Failed to create kqueue\n", .{});
+            return;
+        }
+        defer _ = c.close(kq);
+
+        // Set up timer event for periodic monitoring
+        var timer_event: cc.struct_kevent = std.mem.zeroes(cc.struct_kevent);
+        timer_event.ident = 1; // Timer ID
+        timer_event.filter = cc.EVFILT_TIMER;
+        timer_event.flags = cc.EV_ADD | cc.EV_ENABLE;
+        timer_event.data = @intCast(POLLING_INTERVAL_MILLISECONDS);
+
+        if (cc.kevent(kq, &timer_event, 1, null, 0, null) == -1) {
+            print("Error: Failed to add timer event\n", .{});
+            return;
+        }
+
+        // Set up signal events for graceful shutdown
+        var sigterm_event: cc.struct_kevent = std.mem.zeroes(cc.struct_kevent);
+        sigterm_event.ident = @intCast(cc.SIGTERM);
+        sigterm_event.filter = cc.EVFILT_SIGNAL;
+        sigterm_event.flags = cc.EV_ADD | cc.EV_ENABLE;
+
+        var sigint_event: cc.struct_kevent = std.mem.zeroes(cc.struct_kevent);
+        sigint_event.ident = @intCast(cc.SIGINT);
+        sigint_event.filter = cc.EVFILT_SIGNAL;
+        sigint_event.flags = cc.EV_ADD | cc.EV_ENABLE;
+
+        // Block signals so kqueue can handle them
+        var sigset: cc.sigset_t = undefined;
+        _ = cc.sigemptyset(&sigset);
+        _ = cc.sigaddset(&sigset, cc.SIGTERM);
+        _ = cc.sigaddset(&sigset, cc.SIGINT);
+        _ = cc.sigprocmask(cc.SIG_BLOCK, &sigset, null);
+
+        if (cc.kevent(kq, &sigterm_event, 1, null, 0, null) == -1) {
+            print("Warning: Failed to add SIGTERM event\n", .{});
+        }
+
+        if (cc.kevent(kq, &sigint_event, 1, null, 0, null) == -1) {
+            print("Warning: Failed to add SIGINT event\n", .{});
+        }
+
+        // Event loop
+        var events: [10]cc.struct_kevent = undefined;
 
         while (self.running and g_daemon_running) {
-            self.checkDailyReset();
+            // Wait for events (blocking)
+            const nevents = cc.kevent(kq, null, 0, &events, events.len, null);
 
-            for (self.app_rules.items) |*rule| {
-                try self.checkAndEnforceTimeLimit(rule);
+            if (nevents == -1) {
+                print("Error: kevent failed\n", .{});
+                break;
             }
 
-            stdtime.sleep(POLLING_INTERVAL_NS);
+            // Process events
+            for (events[0..@intCast(nevents)]) |event| {
+                switch (event.filter) {
+                    cc.EVFILT_TIMER => {
+                        // Timer fired - do periodic monitoring
+                        self.checkDailyReset();
+
+                        for (self.app_rules.items) |*rule| {
+                            try self.checkAndEnforceTimeLimit(rule);
+                        }
+                    },
+                    cc.EVFILT_SIGNAL => {
+                        // Signal received - graceful shutdown
+                        print("Received signal {d}, shutting down gracefully...\n", .{event.ident});
+                        g_daemon_running = false;
+                        self.running = false;
+                    },
+                    else => {
+                        // Unknown event type
+                        print("Warning: Unknown event filter {d}\n", .{event.filter});
+                    },
+                }
+            }
         }
+
+        print("Pishleme daemon stopped\n", .{});
     }
 };
 
@@ -317,9 +394,6 @@ pub fn main() !void {
         return;
     }
 
-    // Set up signal handlers for graceful shutdown
-    _ = cc.signal(cc.SIGTERM, signalHandler);
-    _ = cc.signal(cc.SIGINT, signalHandler);
 
     var daemon = PishlemeDaemon.init(allocator);
     defer daemon.deinit();
