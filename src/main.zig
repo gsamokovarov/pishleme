@@ -30,7 +30,6 @@ const AppRule = struct {
     elapsed_time: u64 = 0,
     process_ids: ArrayList(c.pid_t),
     grace_period_start: ?i64 = null,
-    allowed_hours: ?struct { start: u8, end: u8 } = null,
 
     fn init(allocator: Allocator, name: []const u8, time_limit_seconds: u64) AppRule {
         return AppRule{
@@ -47,18 +46,6 @@ const AppRule = struct {
     fn isTimeExceeded(self: *const AppRule) bool {
         return self.elapsed_time >= self.time_limit_seconds;
     }
-
-    fn isCurrentlyAllowed(self: *const AppRule) bool {
-        if (self.allowed_hours == null) return true;
-
-        const now_time_t = time(null);
-        const local_time = localtime(&now_time_t) orelse return true;
- 
-        const current_hour = @as(u8, @intCast(local_time.tm_hour));
-
-        const allowed = self.allowed_hours.?;
-        return current_hour >= allowed.start and current_hour < allowed.end;
-    }
 };
 
 const PishlemeDaemon = struct {
@@ -66,6 +53,7 @@ const PishlemeDaemon = struct {
     app_rules: ArrayList(AppRule),
     running: bool = true,
     last_reset_day: i64,
+    global_allowed_hours: ?struct { start: u8, end: u8 } = null,
 
     fn init(allocator: Allocator) PishlemeDaemon {
         const now = stdtime.timestamp();
@@ -90,10 +78,20 @@ const PishlemeDaemon = struct {
         try self.app_rules.append(rule);
     }
 
-    fn addAppRuleWithHours(self: *PishlemeDaemon, name: []const u8, time_limit_seconds: u64, start_hour: u8, end_hour: u8) !void {
-        var rule = AppRule.init(self.allocator, name, time_limit_seconds);
-        rule.allowed_hours = .{ .start = start_hour, .end = end_hour };
-        try self.app_rules.append(rule);
+    fn setGlobalAllowedHours(self: *PishlemeDaemon, start_hour: u8, end_hour: u8) void {
+        self.global_allowed_hours = .{ .start = start_hour, .end = end_hour };
+    }
+
+    fn isGloballyAllowed(self: *const PishlemeDaemon) bool {
+        if (self.global_allowed_hours == null) return true;
+
+        const now_time_t = time(null);
+        const local_time = localtime(&now_time_t) orelse return true;
+
+        const current_hour = @as(u8, @intCast(local_time.tm_hour));
+
+        const allowed = self.global_allowed_hours.?;
+        return current_hour >= allowed.start and current_hour < allowed.end;
     }
 
     fn findProcessesByName(self: *PishlemeDaemon, app_name: []const u8) !ArrayList(c.pid_t) {
@@ -176,7 +174,7 @@ const PishlemeDaemon = struct {
             return;
         }
 
-        if (!rule.isCurrentlyAllowed()) {
+        if (!self.isGloballyAllowed()) {
             print("{s}: Outside allowed hours. Terminating processes...\n", .{rule.name});
             for (rule.process_ids.items) |pid| {
                 killProcess(pid);
@@ -277,12 +275,13 @@ fn printUsage(program_name: []const u8) void {
     print("Usage: {s} [options]\n", .{program_name});
     print("Options:\n", .{});
     print("  --app <name> --time <seconds>        Monitor application and enforce time limit\n", .{});
-    print("  --hours <start>-<end>               Restrict application to specific hours (24-hour format)\n", .{});
+    print("  --hours <start>-<end>               Restrict ALL applications to specific hours (24-hour format)\n", .{});
     print("  --help                               Show this help message\n", .{});
     print("\nExamples:\n", .{});
+    print("  {s} --hours 9-17 --app Safari --time 3600 --app Discord --time 1800\n", .{program_name});
+    print("  This sets global hours 9AM-5PM for all apps, then monitors Safari (1h) and Discord (30m)\n", .{});
     print("  {s} --app Safari --time 3600\n", .{program_name});
-    print("  {s} --app Discord --time 1800 --hours 10-20\n", .{program_name});
-    print("  This monitors Discord for 30 minutes only between 10AM and 8PM\n", .{});
+    print("  This monitors Safari for 1 hour with no time restrictions\n", .{});
 }
 
 pub fn main() !void {
@@ -306,6 +305,41 @@ pub fn main() !void {
         if (std.mem.eql(u8, args[i], "--help")) {
             printUsage(args[0]);
             return;
+        } else if (std.mem.eql(u8, args[i], "--hours")) {
+            if (i + 1 >= args.len) {
+                print("Error: --hours must be followed by hour range (e.g., 10-20)\n", .{});
+                printUsage(args[0]);
+                return;
+            }
+
+            const hours_str = args[i + 1];
+            const dash_pos = std.mem.indexOf(u8, hours_str, "-") orelse {
+                print("Error: Invalid hour range format '{s}'. Use format like 10-20\n", .{hours_str});
+                return;
+            };
+
+            const start_str = hours_str[0..dash_pos];
+            const end_str = hours_str[dash_pos + 1..];
+
+            const start_hour = std.fmt.parseInt(u8, start_str, 10) catch {
+                print("Error: Invalid start hour '{s}'\n", .{start_str});
+                return;
+            };
+
+            const end_hour = std.fmt.parseInt(u8, end_str, 10) catch {
+                print("Error: Invalid end hour '{s}'\n", .{end_str});
+                return;
+            };
+
+            if (start_hour >= 24 or end_hour > 24 or start_hour >= end_hour) {
+                print("Error: Invalid hour range {d}-{d}. Hours must be 0-23 and start < end\n", .{ start_hour, end_hour });
+                return;
+            }
+
+            daemon.setGlobalAllowedHours(start_hour, end_hour);
+            print("Set global allowed hours: {d}:00-{d}:00\n", .{ start_hour, end_hour });
+
+            i += 2;
         } else if (std.mem.eql(u8, args[i], "--app")) {
             if (i + 3 >= args.len or !std.mem.eql(u8, args[i + 2], "--time")) {
                 print("Error: --app must be followed by app name and --time with seconds\n", .{});
@@ -320,53 +354,10 @@ pub fn main() !void {
                 return;
             };
 
-            var next_i = i + 4;
-            var start_hour: ?u8 = null;
-            var end_hour: ?u8 = null;
+            try daemon.addAppRule(app_name, time_limit);
+            print("Added rule: {s} - {d} seconds\n", .{ app_name, time_limit });
 
-            if (next_i < args.len and std.mem.eql(u8, args[next_i], "--hours")) {
-                if (next_i + 1 >= args.len) {
-                    print("Error: --hours must be followed by hour range (e.g., 10-20)\n", .{});
-                    printUsage(args[0]);
-                    return;
-                }
-
-                const hours_str = args[next_i + 1];
-                const dash_pos = std.mem.indexOf(u8, hours_str, "-") orelse {
-                    print("Error: Invalid hour range format '{s}'. Use format like 10-20\n", .{hours_str});
-                    return;
-                };
-
-                const start_str = hours_str[0..dash_pos];
-                const end_str = hours_str[dash_pos + 1..];
-
-                start_hour = std.fmt.parseInt(u8, start_str, 10) catch {
-                    print("Error: Invalid start hour '{s}'\n", .{start_str});
-                    return;
-                };
-
-                end_hour = std.fmt.parseInt(u8, end_str, 10) catch {
-                    print("Error: Invalid end hour '{s}'\n", .{end_str});
-                    return;
-                };
-
-                if (start_hour.? >= 24 or end_hour.? > 24 or start_hour.? >= end_hour.?) {
-                    print("Error: Invalid hour range {d}-{d}. Hours must be 0-23 and start < end\n", .{ start_hour.?, end_hour.? });
-                    return;
-                }
-
-                next_i += 2;
-            }
-
-            if (start_hour != null and end_hour != null) {
-                try daemon.addAppRuleWithHours(app_name, time_limit, start_hour.?, end_hour.?);
-                print("Added rule: {s} - {d} seconds, allowed {d}:00-{d}:00\n", .{ app_name, time_limit, start_hour.?, end_hour.? });
-            } else {
-                try daemon.addAppRule(app_name, time_limit);
-                print("Added rule: {s} - {d} seconds\n", .{ app_name, time_limit });
-            }
-
-            i = next_i;
+            i += 4;
         } else {
             print("Error: Unknown argument '{s}'\n", .{args[i]});
             printUsage(args[0]);
