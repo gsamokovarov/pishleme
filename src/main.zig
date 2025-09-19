@@ -33,16 +33,16 @@ const AppRule = struct {
     process_ids: ArrayList(c.pid_t),
     grace_period_start: ?i64 = null,
 
-    fn init(allocator: Allocator, name: []const u8, time_limit_seconds: u64) AppRule {
+    fn init(_: Allocator, name: []const u8, time_limit_seconds: u64) AppRule {
         return AppRule{
             .name = name,
             .time_limit_seconds = time_limit_seconds,
-            .process_ids = ArrayList(c.pid_t).init(allocator),
+            .process_ids = ArrayList(c.pid_t){},
         };
     }
 
-    fn deinit(self: *AppRule) void {
-        self.process_ids.deinit();
+    fn deinit(self: *AppRule, allocator: Allocator) void {
+        self.process_ids.deinit(allocator);
     }
 
     fn isTimeExceeded(self: *const AppRule) bool {
@@ -68,21 +68,21 @@ const PishlemeDaemon = struct {
 
         return PishlemeDaemon{
             .allocator = allocator,
-            .app_rules = ArrayList(AppRule).init(allocator),
+            .app_rules = ArrayList(AppRule){},
             .last_reset_day = current_day,
         };
     }
 
     fn deinit(self: *PishlemeDaemon) void {
         for (self.app_rules.items) |*rule| {
-            rule.deinit();
+            rule.deinit(self.allocator);
         }
-        self.app_rules.deinit();
+        self.app_rules.deinit(self.allocator);
     }
 
     fn addAppRule(self: *PishlemeDaemon, name: []const u8, time_limit_seconds: u64) !void {
         const rule = AppRule.init(self.allocator, name, time_limit_seconds);
-        try self.app_rules.append(rule);
+        try self.app_rules.append(self.allocator, rule);
     }
 
     fn setGlobalAllowedHours(self: *PishlemeDaemon, start_hour: u8, end_hour: u8) void {
@@ -105,8 +105,8 @@ const PishlemeDaemon = struct {
     }
 
     fn findProcessesByName(self: *PishlemeDaemon, app_name: []const u8) !ArrayList(c.pid_t) {
-        var pids = ArrayList(c.pid_t).init(self.allocator);
-        errdefer pids.deinit();
+        var pids = ArrayList(c.pid_t){};
+        errdefer pids.deinit(self.allocator);
 
         // Get process list size first
         var mib = [4]c_int{ cc.CTL_KERN, cc.KERN_PROC, cc.KERN_PROC_ALL, 0 };
@@ -152,7 +152,7 @@ const PishlemeDaemon = struct {
 
             // Case-insensitive partial match
             if (std.ascii.indexOfIgnoreCase(proc_name, app_name) != null) {
-                try pids.append(pid);
+                try pids.append(self.allocator, pid);
             }
         }
 
@@ -161,11 +161,11 @@ const PishlemeDaemon = struct {
 
     fn updateProcessList(self: *PishlemeDaemon, rule: *AppRule) !void {
         rule.process_ids.clearRetainingCapacity();
-        const current_pids = try self.findProcessesByName(rule.name);
-        defer current_pids.deinit();
+        var current_pids = try self.findProcessesByName(rule.name);
+        defer current_pids.deinit(self.allocator);
 
         for (current_pids.items) |pid| {
-            try rule.process_ids.append(pid);
+            try rule.process_ids.append(self.allocator, pid);
         }
 
     }
@@ -280,7 +280,7 @@ const PishlemeDaemon = struct {
         timer_event.ident = 1; // Timer ID
         timer_event.filter = cc.EVFILT_TIMER;
         timer_event.flags = cc.EV_ADD | cc.EV_ENABLE;
-        timer_event.data = @intCast(POLLING_INTERVAL_MILLISECONDS);
+        timer_event.data = POLLING_INTERVAL_MILLISECONDS;
 
         if (cc.kevent(kq, &timer_event, 1, null, 0, null) == -1) {
             print("Error: Failed to add timer event\n", .{});
@@ -289,12 +289,12 @@ const PishlemeDaemon = struct {
 
         // Set up signal events for graceful shutdown
         var sigterm_event: cc.struct_kevent = std.mem.zeroes(cc.struct_kevent);
-        sigterm_event.ident = @intCast(cc.SIGTERM);
+        sigterm_event.ident = cc.SIGTERM;
         sigterm_event.filter = cc.EVFILT_SIGNAL;
         sigterm_event.flags = cc.EV_ADD | cc.EV_ENABLE;
 
         var sigint_event: cc.struct_kevent = std.mem.zeroes(cc.struct_kevent);
-        sigint_event.ident = @intCast(cc.SIGINT);
+        sigint_event.ident = cc.SIGINT;
         sigint_event.filter = cc.EVFILT_SIGNAL;
         sigint_event.flags = cc.EV_ADD | cc.EV_ENABLE;
 
