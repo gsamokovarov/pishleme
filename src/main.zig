@@ -6,20 +6,11 @@ const process = std.process;
 const stdtime = std.time;
 const c = std.c;
 
-const tm = extern struct {
-    tm_sec: c_int,
-    tm_min: c_int,
-    tm_hour: c_int,
-    tm_mday: c_int,
-    tm_mon: c_int,
-    tm_year: c_int,
-    tm_wday: c_int,
-    tm_yday: c_int,
-    tm_isdst: c_int,
-};
-
-extern fn time(tloc: ?*c.time_t) c.time_t;
-extern fn localtime(timer: *const c.time_t) ?*tm;
+const cc = @cImport({
+    @cInclude("sys/sysctl.h");
+    @cInclude("sys/proc.h");
+    @cInclude("time.h");
+});
 
 const SIGKILL = 9;
 const SIGTERM = 15;
@@ -105,11 +96,11 @@ const PishlemeDaemon = struct {
     fn isGloballyAllowed(self: *const PishlemeDaemon) bool {
         if (self.global_allowed_hours == null) return true;
 
-        const now_time_t = time(null);
-        const local_time = localtime(&now_time_t) orelse return true;
+        const now_time_t = cc.time(null);
+        const local_time = cc.localtime(&now_time_t) orelse return true;
 
-        const current_hour = std.math.cast(u8, local_time.tm_hour) orelse {
-            print("Warning: Invalid hour value {d}, allowing access\n", .{local_time.tm_hour});
+        const current_hour = std.math.cast(u8, local_time.*.tm_hour) orelse {
+            print("Warning: Invalid hour value {d}, allowing access\n", .{local_time.*.tm_hour});
             return true;
         };
 
@@ -121,39 +112,56 @@ const PishlemeDaemon = struct {
         var pids = ArrayList(c.pid_t).init(self.allocator);
         errdefer pids.deinit();
 
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = &[_][]const u8{ "pgrep", "-i", app_name },
-        }) catch |err| {
-            print("Warning: Failed to execute pgrep for '{s}': {}\n", .{ app_name, err });
+        // Get process list size first
+        var mib = [4]c_int{ cc.CTL_KERN, cc.KERN_PROC, cc.KERN_PROC_ALL, 0 };
+        var size: usize = 0;
+
+        if (cc.sysctl(&mib, 3, null, &size, null, 0) != 0) {
+            print("Warning: Failed to get process list size for '{s}'\n", .{app_name});
+            return pids;
+        }
+
+        const num_procs = size / @sizeOf(cc.kinfo_proc);
+        if (num_procs == 0) return pids;
+
+        // Allocate buffer for process list using actual struct
+        const proc_list = self.allocator.alloc(cc.kinfo_proc, num_procs) catch |err| {
+            print("Warning: Failed to allocate memory for process list: {}\n", .{err});
             return pids;
         };
+        defer self.allocator.free(proc_list);
 
-        return self.parseProcessOutput(result, &pids);
-    }
+        // Get actual process list
+        var actual_size = size;
+        if (cc.sysctl(&mib, 3, proc_list.ptr, &actual_size, null, 0) != 0) {
+            print("Warning: Failed to get process list for '{s}'\n", .{app_name});
+            return pids;
+        }
 
-    fn parseProcessOutput(self: *PishlemeDaemon, result: std.process.Child.RunResult, pids: *ArrayList(c.pid_t)) !ArrayList(c.pid_t) {
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
+        const actual_num_procs = actual_size / @sizeOf(cc.kinfo_proc);
 
-        if (result.term.Exited == 0) {
-            var lines = std.mem.splitSequence(u8, result.stdout, "\n");
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                const trimmed = std.mem.trim(u8, line, " \t\n");
-                if (trimmed.len == 0) continue;
+        // Search for matching process names using actual struct fields
+        for (proc_list[0..actual_num_procs]) |proc| {
+            const pid = proc.kp_proc.p_pid;
 
-                const pid = std.fmt.parseInt(c.pid_t, trimmed, 10) catch {
-                    print("Warning: Failed to parse PID '{s}'\n", .{trimmed});
-                    continue;
-                };
+            // Skip invalid PIDs
+            if (pid <= 0) continue;
+
+            // Convert C string to Zig string
+            const proc_name_len = std.mem.indexOfScalar(u8, &proc.kp_proc.p_comm, 0) orelse proc.kp_proc.p_comm.len;
+            const proc_name = proc.kp_proc.p_comm[0..proc_name_len];
+
+            // Skip empty names
+            if (proc_name.len == 0) continue;
+
+            // Case-insensitive partial match
+            if (std.ascii.indexOfIgnoreCase(proc_name, app_name) != null) {
                 try pids.append(pid);
             }
         }
 
-        return pids.*;
+        return pids;
     }
-
 
     fn updateProcessList(self: *PishlemeDaemon, rule: *AppRule) !void {
         rule.process_ids.clearRetainingCapacity();
@@ -287,7 +295,6 @@ fn killProcesses(rule: *AppRule, reason: []const u8) void {
         }
     }
 }
-
 
 fn printUsage(program_name: []const u8) void {
     print("Usage: {s} [options]\n", .{program_name});
