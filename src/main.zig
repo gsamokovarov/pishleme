@@ -22,6 +22,21 @@ extern fn time(tloc: ?*c.time_t) c.time_t;
 extern fn localtime(timer: *const c.time_t) ?*tm;
 
 const SIGKILL = 9;
+const SIGTERM = 15;
+const SIGINT = 2;
+
+const SECONDS_PER_DAY: i64 = 86400;
+const GRACE_PERIOD_SECONDS: u64 = 5;
+const POLLING_INTERVAL_NS: u64 = 1 * std.time.ns_per_s;
+
+var g_daemon_running: bool = true;
+
+extern fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.C) void) ?*const fn (c_int) callconv(.C) void;
+
+fn signalHandler(sig: c_int) callconv(.C) void {
+    _ = sig;
+    g_daemon_running = false;
+}
 
 const AppRule = struct {
     name: []const u8,
@@ -46,6 +61,11 @@ const AppRule = struct {
     fn isTimeExceeded(self: *const AppRule) bool {
         return self.elapsed_time >= self.time_limit_seconds;
     }
+
+    fn clearState(self: *AppRule) void {
+        self.process_ids.clearRetainingCapacity();
+        self.grace_period_start = null;
+    }
 };
 
 const PishlemeDaemon = struct {
@@ -57,7 +77,7 @@ const PishlemeDaemon = struct {
 
     fn init(allocator: Allocator) PishlemeDaemon {
         const now = stdtime.timestamp();
-        const current_day = @divFloor(now, 86400); // 86400 seconds in a day
+        const current_day = @divFloor(now, SECONDS_PER_DAY);
 
         return PishlemeDaemon{
             .allocator = allocator,
@@ -88,7 +108,10 @@ const PishlemeDaemon = struct {
         const now_time_t = time(null);
         const local_time = localtime(&now_time_t) orelse return true;
 
-        const current_hour = @as(u8, @intCast(local_time.tm_hour));
+        const current_hour = std.math.cast(u8, local_time.tm_hour) orelse {
+            print("Warning: Invalid hour value {d}, allowing access\n", .{local_time.tm_hour});
+            return true;
+        };
 
         const allowed = self.global_allowed_hours.?;
         return current_hour >= allowed.start and current_hour < allowed.end;
@@ -101,7 +124,8 @@ const PishlemeDaemon = struct {
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &[_][]const u8{ "pgrep", "-i", app_name },
-        }) catch {
+        }) catch |err| {
+            print("Warning: Failed to execute pgrep for '{s}': {}\n", .{ app_name, err });
             return pids;
         };
 
@@ -140,14 +164,6 @@ const PishlemeDaemon = struct {
             try rule.process_ids.append(pid);
         }
 
-        // Debug output to help troubleshoot
-        if (current_pids.items.len > 0) {
-            print("DEBUG: Found {d} processes for {s}: ", .{ current_pids.items.len, rule.name });
-            for (current_pids.items) |pid| {
-                print("{d} ", .{pid});
-            }
-            print("\n", .{});
-        }
     }
 
     fn checkAndEnforceTimeLimit(self: *PishlemeDaemon, rule: *AppRule) !void {
@@ -168,6 +184,7 @@ const PishlemeDaemon = struct {
 
         if (!self.isGloballyAllowed()) {
             killProcesses(rule, "Outside allowed hours");
+            rule.clearState();
             if (rule.start_time != null) {
                 const session_time = std.math.cast(u64, now - rule.start_time.?) orelse 0;
                 rule.elapsed_time = std.math.add(u64, rule.elapsed_time, session_time) catch rule.elapsed_time;
@@ -179,14 +196,15 @@ const PishlemeDaemon = struct {
         if (rule.isTimeExceeded()) {
             if (rule.grace_period_start == null) {
                 rule.grace_period_start = now;
-                print("Time already exceeded for {s} ({d}s). Grace period: 5 seconds before termination.\n", .{ rule.name, rule.elapsed_time });
+                print("Time already exceeded for {s} ({d}s). Grace period: {d} seconds before termination.\n", .{ rule.name, rule.elapsed_time, GRACE_PERIOD_SECONDS });
             }
 
             const grace_elapsed = std.math.cast(u64, now - rule.grace_period_start.?) orelse 0;
-            if (grace_elapsed >= 5) {
+            if (grace_elapsed >= GRACE_PERIOD_SECONDS) {
                 killProcesses(rule, "Grace period expired");
+                rule.clearState();
             } else {
-                const grace_remaining = 5 - grace_elapsed;
+                const grace_remaining = GRACE_PERIOD_SECONDS - grace_elapsed;
                 print("{s}: Time limit exceeded. Terminating in {d} seconds...\n", .{ rule.name, grace_remaining });
             }
             return;
@@ -211,9 +229,10 @@ const PishlemeDaemon = struct {
             rule.elapsed_time = total_time;
             rule.start_time = null;
 
-            const reason = std.fmt.allocPrint(self.allocator, "Time limit reached ({d}s)", .{total_time}) catch "Time limit reached";
-            defer if (!std.mem.eql(u8, reason, "Time limit reached")) self.allocator.free(reason);
+            var reason_buffer: [64]u8 = undefined;
+            const reason = std.fmt.bufPrint(&reason_buffer, "Time limit reached ({d}s)", .{total_time}) catch "Time limit reached";
             killProcesses(rule, reason);
+            rule.clearState();
         } else {
             const remaining = rule.time_limit_seconds - total_time;
             print("{s}: Running - {d}/{d}s used, {d}s remaining\n", .{ rule.name, total_time, rule.time_limit_seconds, remaining });
@@ -222,7 +241,7 @@ const PishlemeDaemon = struct {
 
     fn checkDailyReset(self: *PishlemeDaemon) void {
         const now = stdtime.timestamp();
-        const current_day = @divFloor(now, 86400); // 86400 seconds in a day
+        const current_day = @divFloor(now, SECONDS_PER_DAY);
 
         if (current_day > self.last_reset_day) {
             print("Daily reset: Resetting all application timers\n", .{});
@@ -243,14 +262,14 @@ const PishlemeDaemon = struct {
         print("Pishleme daemon started. Monitoring {} applications...\n", .{self.app_rules.items.len});
         print("Daily reset enabled: timers reset at midnight each day\n", .{});
 
-        while (self.running) {
+        while (self.running and g_daemon_running) {
             self.checkDailyReset();
 
             for (self.app_rules.items) |*rule| {
                 try self.checkAndEnforceTimeLimit(rule);
             }
 
-            stdtime.sleep(1 * stdtime.ns_per_s);
+            stdtime.sleep(POLLING_INTERVAL_NS);
         }
     }
 };
@@ -267,9 +286,8 @@ fn killProcesses(rule: *AppRule, reason: []const u8) void {
             print("Failed to kill process {d}\n", .{pid});
         }
     }
-    rule.process_ids.clearRetainingCapacity();
-    rule.grace_period_start = null;
 }
+
 
 fn printUsage(program_name: []const u8) void {
     print("Usage: {s} [options]\n", .{program_name});
@@ -296,6 +314,10 @@ pub fn main() !void {
         printUsage(args[0]);
         return;
     }
+
+    // Set up signal handlers for graceful shutdown
+    _ = signal(SIGTERM, signalHandler);
+    _ = signal(SIGINT, signalHandler);
 
     var daemon = PishlemeDaemon.init(allocator);
     defer daemon.deinit();
