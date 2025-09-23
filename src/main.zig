@@ -18,13 +18,6 @@ const SECONDS_PER_DAY: i64 = 86400;
 const GRACE_PERIOD_SECONDS: u64 = 5;
 const POLLING_INTERVAL_MILLISECONDS: u64 = 1000;
 
-var g_daemon_running: bool = true;
-
-fn signalHandler(sig: c_int) callconv(.C) void {
-    _ = sig;
-    g_daemon_running = false;
-}
-
 const AppRule = struct {
     name: []const u8,
     time_limit_seconds: u64,
@@ -167,7 +160,6 @@ const PishlemeDaemon = struct {
         for (current_pids.items) |pid| {
             try rule.process_ids.append(self.allocator, pid);
         }
-
     }
 
     fn checkAndEnforceTimeLimit(self: *PishlemeDaemon, rule: *AppRule) !void {
@@ -264,8 +256,6 @@ const PishlemeDaemon = struct {
 
     fn run(self: *PishlemeDaemon) !void {
         print("Pishleme daemon started. Monitoring {} applications...\n", .{self.app_rules.items.len});
-        print("Daily reset enabled: timers reset at midnight each day\n", .{});
-        print("Using event-driven kqueue loop for efficient monitoring\n", .{});
 
         // Create kqueue for event monitoring
         const kq = cc.kqueue();
@@ -316,7 +306,7 @@ const PishlemeDaemon = struct {
         // Event loop
         var events: [10]cc.struct_kevent = undefined;
 
-        while (self.running and g_daemon_running) {
+        while (self.running) {
             // Wait for events (blocking)
             const nevents = cc.kevent(kq, null, 0, &events, events.len, null);
 
@@ -339,7 +329,6 @@ const PishlemeDaemon = struct {
                     cc.EVFILT_SIGNAL => {
                         // Signal received - graceful shutdown
                         print("Received signal {d}, shutting down gracefully...\n", .{event.ident});
-                        g_daemon_running = false;
                         self.running = false;
                     },
                     else => {
@@ -393,7 +382,6 @@ pub fn main() !void {
         printUsage(args[0]);
         return;
     }
-
 
     var daemon = PishlemeDaemon.init(allocator);
     defer daemon.deinit();
