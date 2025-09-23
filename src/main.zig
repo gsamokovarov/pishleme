@@ -172,7 +172,6 @@ const PishlemeDaemon = struct {
                 const session_time = std.math.cast(u64, now - rule.start_time.?) orelse 0;
                 rule.elapsed_time = std.math.add(u64, rule.elapsed_time, session_time) catch rule.elapsed_time;
                 rule.start_time = null;
-                print("{s}: Not running. Total usage: {d}s\n", .{ rule.name, rule.elapsed_time });
             }
             rule.grace_period_start = null;
             return;
@@ -192,46 +191,32 @@ const PishlemeDaemon = struct {
         if (rule.isTimeExceeded()) {
             if (rule.grace_period_start == null) {
                 rule.grace_period_start = now;
-                print("Time already exceeded for {s} ({d}s). Grace period: {d} seconds before termination.\n", .{ rule.name, rule.elapsed_time, GRACE_PERIOD_SECONDS });
             }
 
             const grace_elapsed = std.math.cast(u64, now - rule.grace_period_start.?) orelse 0;
             if (grace_elapsed >= GRACE_PERIOD_SECONDS) {
                 killProcesses(rule, "Grace period expired");
                 rule.clearState();
-            } else {
-                const grace_remaining = GRACE_PERIOD_SECONDS - grace_elapsed;
-                print("{s}: Time limit exceeded. Terminating in {d} seconds...\n", .{ rule.name, grace_remaining });
             }
             return;
         }
 
         if (rule.start_time == null) {
             rule.start_time = now;
-            print("{s}: Started running. Current total usage: {d}s\n", .{ rule.name, rule.elapsed_time });
         }
 
         const session_time = std.math.cast(u64, now - rule.start_time.?) orelse {
-            print("Warning: Session time overflow for {s}, resetting\n", .{rule.name});
             rule.start_time = now;
             return;
         };
-        const total_time = std.math.add(u64, rule.elapsed_time, session_time) catch blk: {
-            print("Warning: Total time overflow for {s}, capping at limit\n", .{rule.name});
-            break :blk rule.time_limit_seconds;
-        };
+        const total_time = std.math.add(u64, rule.elapsed_time, session_time) catch rule.time_limit_seconds;
 
         if (total_time >= rule.time_limit_seconds) {
             rule.elapsed_time = total_time;
             rule.start_time = null;
 
-            var reason_buffer: [64]u8 = undefined;
-            const reason = std.fmt.bufPrint(&reason_buffer, "Time limit reached ({d}s)", .{total_time}) catch "Time limit reached";
-            killProcesses(rule, reason);
+            killProcesses(rule, "Time limit reached");
             rule.clearState();
-        } else {
-            const remaining = rule.time_limit_seconds - total_time;
-            print("{s}: Running - {d}/{d}s used, {d}s remaining\n", .{ rule.name, total_time, rule.time_limit_seconds, remaining });
         }
     }
 
@@ -240,14 +225,11 @@ const PishlemeDaemon = struct {
         const current_day = @divFloor(now, SECONDS_PER_DAY);
 
         if (current_day > self.last_reset_day) {
-            print("Daily reset: Resetting all application timers\n", .{});
-
             for (self.app_rules.items) |*rule| {
                 rule.elapsed_time = 0;
                 rule.start_time = null;
                 rule.grace_period_start = null;
                 rule.process_ids.clearRetainingCapacity();
-                print("Reset timer for {s}\n", .{rule.name});
             }
 
             self.last_reset_day = current_day;
@@ -255,8 +237,6 @@ const PishlemeDaemon = struct {
     }
 
     fn run(self: *PishlemeDaemon) !void {
-        print("Pishleme daemon started. Monitoring {} applications...\n", .{self.app_rules.items.len});
-
         // Create kqueue for event monitoring
         const kq = cc.kqueue();
         if (kq == -1) {
@@ -343,18 +323,99 @@ const PishlemeDaemon = struct {
     }
 };
 
-fn killProcesses(rule: *AppRule, reason: []const u8) void {
+fn killProcesses(rule: *AppRule, _: []const u8) void {
     if (rule.process_ids.items.len == 0) return;
 
-    print("{s}: {s}. Terminating {d} processes...\n", .{ rule.name, reason, rule.process_ids.items.len });
     for (rule.process_ids.items) |pid| {
-        const result = c.kill(pid, cc.SIGKILL);
-        if (result == 0) {
-            print("Killed process {d} with SIGKILL\n", .{pid});
-        } else {
-            print("Failed to kill process {d}\n", .{pid});
-        }
+        _ = c.kill(pid, cc.SIGKILL);
     }
+}
+
+fn generatePlistContent(allocator: Allocator, binary_path: []const u8, args: []const []const u8) ![]u8 {
+    var plist_content = std.ArrayList(u8){};
+    defer plist_content.deinit(allocator);
+
+    try plist_content.appendSlice(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>com.pishleme.daemon</string>
+        \\    <key>ProgramArguments</key>
+        \\    <array>
+        \\
+    );
+
+    try plist_content.appendSlice(allocator, "        <string>");
+    try plist_content.appendSlice(allocator, binary_path);
+    try plist_content.appendSlice(allocator, "</string>\n");
+
+    // Add all arguments except --install
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--install")) {
+            i += 1;
+            continue;
+        }
+
+        try plist_content.appendSlice(allocator, "        <string>");
+        try plist_content.appendSlice(allocator, args[i]);
+        try plist_content.appendSlice(allocator, "</string>\n");
+        i += 1;
+    }
+
+    try plist_content.appendSlice(allocator,
+        \\    </array>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <key>KeepAlive</key>
+        \\    <true/>
+        \\    <key>StandardOutPath</key>
+        \\    <string>/var/log/pishleme.log</string>
+        \\    <key>StandardErrorPath</key>
+        \\    <string>/var/log/pishleme.log</string>
+        \\</dict>
+        \\</plist>
+        \\
+    );
+
+    return plist_content.toOwnedSlice(allocator);
+}
+
+fn installPlist(allocator: Allocator, binary_path: []const u8, args: []const []const u8) !void {
+    const plist_content = try generatePlistContent(allocator, binary_path, args);
+    defer allocator.free(plist_content);
+
+    // Get home directory
+    const home = std.posix.getenv("HOME") orelse {
+        print("Error: Could not get HOME directory\n", .{});
+        return;
+    };
+
+    // Create LaunchAgents directory path
+    const launch_agents_dir = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents", .{home});
+    defer allocator.free(launch_agents_dir);
+
+    const plist_path = try std.fmt.allocPrint(allocator, "{s}/com.pishleme.daemon.plist", .{launch_agents_dir});
+    defer allocator.free(plist_path);
+
+    // Create directory if it doesn't exist
+    std.fs.makeDirAbsolute(launch_agents_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Write plist file
+    const file = try std.fs.createFileAbsolute(plist_path, .{});
+    defer file.close();
+
+    try file.writeAll(plist_content);
+
+    print("Installed launchd plist to: {s}\n", .{plist_path});
+    print("To start the daemon: launchctl load {s}\n", .{plist_path});
+    print("To stop the daemon: launchctl unload {s}\n", .{plist_path});
+    print("To check status: launchctl list | grep pishleme\n", .{});
 }
 
 fn printUsage(program_name: []const u8) void {
@@ -362,12 +423,15 @@ fn printUsage(program_name: []const u8) void {
     print("Options:\n", .{});
     print("  --app <name> --time <seconds>        Monitor application and enforce time limit\n", .{});
     print("  --hours <start>-<end>               Restrict ALL applications to specific hours (24-hour format)\n", .{});
+    print("  --install                            Generate and install launchd plist for daemon mode\n", .{});
     print("  --help                               Show this help message\n", .{});
     print("\nExamples:\n", .{});
     print("  {s} --hours 9-17 --app Safari --time 3600 --app Discord --time 1800\n", .{program_name});
     print("  This sets global hours 9AM-5PM for all apps, then monitors Safari (1h) and Discord (30m)\n", .{});
     print("  {s} --app Safari --time 3600\n", .{program_name});
     print("  This monitors Safari for 1 hour with no time restrictions\n", .{});
+    print("  {s} --install --hours 9-17 --app Safari --time 3600\n", .{program_name});
+    print("  This installs the daemon with the specified rules\n", .{});
 }
 
 pub fn main() !void {
@@ -377,6 +441,23 @@ pub fn main() !void {
 
     const args = try process.argsAlloc(allocator);
     defer process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        printUsage(args[0]);
+        return;
+    }
+
+    // Check for --install option first
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--install")) {
+            // Get absolute path of current binary
+            const binary_path = try std.fs.realpathAlloc(allocator, args[0]);
+            defer allocator.free(binary_path);
+
+            try installPlist(allocator, binary_path, args);
+            return;
+        }
+    }
 
     if (args.len < 3) {
         printUsage(args[0]);
@@ -423,7 +504,6 @@ pub fn main() !void {
             }
 
             daemon.setGlobalAllowedHours(start_hour, end_hour);
-            print("Set global allowed hours: {d}:00-{d}:00\n", .{ start_hour, end_hour });
 
             i += 2;
         } else if (std.mem.eql(u8, args[i], "--app")) {
@@ -441,7 +521,6 @@ pub fn main() !void {
             };
 
             try daemon.addAppRule(app_name, time_limit);
-            print("Added rule: {s} - {d} seconds\n", .{ app_name, time_limit });
 
             i += 4;
         } else {
