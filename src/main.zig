@@ -428,7 +428,7 @@ fn printUsage(program_name: []const u8) void {
     print("Usage: {s} [options]\n", .{program_name});
     print("Options:\n", .{});
     print("  --app <name> --time <seconds>        Monitor application and enforce time limit\n", .{});
-    print("  --hours <start>-<end>               Restrict ALL applications to specific hours (24-hour format)\n", .{});
+    print("  --hours <start>-<end>                Restrict ALL applications to specific hours (24-hour format)\n", .{});
     print("  --install                            Generate and install launchd plist for daemon mode\n", .{});
     print("  --help                               Show this help message\n", .{});
     print("\nExamples:\n", .{});
