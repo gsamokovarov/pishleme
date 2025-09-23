@@ -323,11 +323,17 @@ const PishlemeDaemon = struct {
     }
 };
 
-fn killProcesses(rule: *AppRule, _: []const u8) void {
+fn killProcesses(rule: *AppRule, reason: []const u8) void {
     if (rule.process_ids.items.len == 0) return;
 
+    print("Terminating {d} {s} processes - {s}\n", .{ rule.process_ids.items.len, rule.name, reason });
     for (rule.process_ids.items) |pid| {
-        _ = c.kill(pid, cc.SIGKILL);
+        const result = c.kill(pid, cc.SIGKILL);
+        if (result == 0) {
+            print("Killed process {d} - {s}\n", .{ pid, reason });
+        } else {
+            print("Failed to kill process {d}\n", .{pid});
+        }
     }
 }
 
