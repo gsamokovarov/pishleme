@@ -1,8 +1,8 @@
 # Pishleme
 
-You know the pet deterrent sprays that emit a harmless that keep those pesky
-pets out of forbidden areas? They are effective because they create a negative
-association with the area. And it's not you who has to enforce the rule.
+You know the pet deterrent sprays that keep those pesky pets out of forbidden
+areas? They are effective because they create a negative association with the
+area. And it's not you who has to enforce the rule.
 
 Some kids don't need deterrents. Others do, I call them pishlemes. If you have
 a pishleme, you know what I mean.
