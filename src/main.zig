@@ -336,14 +336,15 @@ fn killProcesses(rule: *AppRule, reason: []const u8) void {
     if (rule.process_ids.items.len == 0) return;
 
     print("Terminating {d} {s} processes - {s}\n", .{ rule.process_ids.items.len, rule.name, reason });
+    print("Terminated ", .{});
     for (rule.process_ids.items) |pid| {
         const result = c.kill(pid, cc.SIGKILL);
-        if (result == 0) {
-            print("Killed process {d} - {s}\n", .{ pid, reason });
-        } else {
-            print("Failed to kill process {d}\n", .{pid});
+        print("{d} ", .{pid});
+        if (result != 0) {
+            print("(pid is hanging) ", .{});
         }
     }
+    print("\n", .{});
 }
 
 fn generatePlistContent(allocator: Allocator, binary_path: []const u8, args: []const []const u8) ![]u8 {
