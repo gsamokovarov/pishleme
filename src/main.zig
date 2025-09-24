@@ -237,6 +237,15 @@ const PishlemeDaemon = struct {
     }
 
     fn run(self: *PishlemeDaemon) !void {
+        print("Pishleme daemon starting:\n", .{});
+        for (self.app_rules.items) |rule| {
+            print("  {s}: {d}s", .{ rule.name, rule.time_limit_seconds });
+        }
+        if (self.global_allowed_hours) |hours| {
+            print(" (global hours: {d}-{d})", .{ hours.start, hours.end });
+        }
+        print("\n", .{});
+
         // Create kqueue for event monitoring
         const kq = cc.kqueue();
         if (kq == -1) {
